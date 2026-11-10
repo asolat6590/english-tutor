@@ -1,0 +1,7 @@
+node_modules/
+bookings.db
+bookings.db-journal
+bookings.db-wal
+bookings.json
+.vercel/
+.env
