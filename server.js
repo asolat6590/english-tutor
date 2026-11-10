@@ -2,11 +2,13 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const templates = require('./views/templates');
 
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.VERCEL ? '/tmp' : __dirname;
 const DB_PATH = path.join(DATA_DIR, 'bookings.db');
 const PUBLIC_DIR = path.join(__dirname, 'public');
+const VIEWS_DIR = path.join(__dirname, 'views');
 
 const SESSION_COOKIE_NAME = 'admin_session';
 const SESSION_TTL_SECONDS = 60 * 60 * 24; // 24 hours
@@ -45,6 +47,16 @@ function verifyPassword(password, salt, storedHashHex) {
   return crypto.timingSafeEqual(derivedKey, storedBuffer);
 }
 
+// Deterministic salt per admin email so serverless instances on Vercel derive the exact same hash
+function deriveDeterministicSalt(email) {
+  const secretSeed = process.env.AUTH_SALT_SECRET || 'elena-vance-tutor-uz-2026-salt';
+  return crypto
+    .createHash('sha256')
+    .update(`${secretSeed}:${email.toLowerCase().trim()}`)
+    .digest('hex')
+    .slice(0, 32);
+}
+
 function formatLocalDate(dateObj) {
   const y = dateObj.getFullYear();
   const m = String(dateObj.getMonth() + 1).padStart(2, '0');
@@ -52,7 +64,7 @@ function formatLocalDate(dateObj) {
   return `${y}-${m}-${d}`;
 }
 
-// Initialize SQLite database (with automatic JSON-file adapter fallback if node:sqlite is unavailable on older serverless runtimes)
+// Initialize SQLite database (with automatic JSON-file adapter fallback if node:sqlite is unavailable)
 let db = null;
 try {
   const { DatabaseSync } = require('node:sqlite');
@@ -92,7 +104,6 @@ try {
     );
   `);
 } catch (sqliteErr) {
-  // Fallback storage adapter for serverless environments without node:sqlite
   const JSON_DB_PATH = path.join(DATA_DIR, 'bookings-store.json');
   function loadStore() {
     try {
@@ -112,21 +123,26 @@ try {
   };
 }
 
-// Unified data access helpers supporting both SQLite and serverless fallback
 const store = {
   ensureSeeded() {
     const initialEmail = (process.env.ADMIN_EMAIL || 'admin@elenavance.uz').toLowerCase().trim();
     const initialPassword = process.env.ADMIN_PASSWORD || 'Admin@2026!';
+    const salt = deriveDeterministicSalt(initialEmail);
+    const passwordHash = hashPassword(initialPassword, salt);
 
     if (!db._isFallback) {
-      const adminCount = db.prepare('SELECT COUNT(*) as count FROM admins').get().count;
-      if (adminCount === 0) {
-        const salt = crypto.randomBytes(16).toString('hex');
-        const passwordHash = hashPassword(initialPassword, salt);
+      const existingAdmin = db.prepare('SELECT id, password_salt FROM admins WHERE email = ?').get(initialEmail);
+      if (!existingAdmin) {
         db.prepare('INSERT INTO admins (email, password_hash, password_salt) VALUES (?, ?, ?)').run(
           initialEmail,
           passwordHash,
           salt
+        );
+      } else if (existingAdmin.password_salt !== salt) {
+        db.prepare('UPDATE admins SET password_hash = ?, password_salt = ? WHERE id = ?').run(
+          passwordHash,
+          salt,
+          existingAdmin.id
         );
       }
 
@@ -183,12 +199,16 @@ const store = {
     } else {
       const s = db.loadStore();
       let changed = false;
-      if (s.admins.length === 0) {
-        const salt = crypto.randomBytes(16).toString('hex');
-        const passwordHash = hashPassword(initialPassword, salt);
+      const existingAdmin = s.admins.find(a => a.email === initialEmail);
+      if (!existingAdmin) {
         s.admins.push({ id: 1, email: initialEmail, password_hash: passwordHash, password_salt: salt });
         changed = true;
+      } else if (existingAdmin.password_salt !== salt) {
+        existingAdmin.password_salt = salt;
+        existingAdmin.password_hash = passwordHash;
+        changed = true;
       }
+
       if (s.bookings.length === 0) {
         const today = new Date();
         const tomorrow = new Date(today);
@@ -290,28 +310,7 @@ const store = {
     if (!token || typeof token !== 'string') return null;
     const nowUnix = Math.floor(Date.now() / 1000);
 
-    // Check DB session table first
-    if (!db._isFallback) {
-      db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(nowUnix);
-      const row = db.prepare(`
-        SELECT s.token, s.expires_at, a.id as admin_id, a.email
-        FROM sessions s
-        JOIN admins a ON a.id = s.admin_id
-        WHERE s.token = ? AND s.expires_at > ?
-      `).get(token, nowUnix);
-      if (row) {
-        return { id: row.admin_id, email: row.email, token: row.token };
-      }
-    } else {
-      const s = db.loadStore();
-      const found = s.sessions.find(item => item.token === token && item.expires_at > nowUnix);
-      if (found) {
-        const admin = s.admins.find(a => a.id === found.admin_id);
-        if (admin) return { id: admin.id, email: admin.email, token };
-      }
-    }
-
-    // Serverless cold-start resilience: verify cryptographic HMAC signature against admin's password_hash
+    // 1. Check HMAC signature first (works statelessly across all Vercel serverless instances!)
     const parts = token.split('.');
     if (parts.length === 4) {
       const [adminIdStr, expiresAtStr, rawId, sig] = parts;
@@ -329,6 +328,20 @@ const store = {
             return { id: admin.id, email: admin.email, token };
           }
         }
+      }
+    }
+
+    // 2. Fallback check in sessions table
+    if (!db._isFallback) {
+      db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(nowUnix);
+      const row = db.prepare(`
+        SELECT s.token, s.expires_at, a.id as admin_id, a.email
+        FROM sessions s
+        JOIN admins a ON a.id = s.admin_id
+        WHERE s.token = ? AND s.expires_at > ?
+      `).get(token, nowUnix);
+      if (row) {
+        return { id: row.admin_id, email: row.email, token: row.token };
       }
     }
 
@@ -438,7 +451,6 @@ const store = {
 
 store.ensureSeeded();
 
-// Parse cookies from request headers
 function parseCookies(req) {
   const header = req.headers.cookie || '';
   const cookies = {};
@@ -459,7 +471,6 @@ function getAuthenticatedAdmin(req) {
   return store.verifySessionToken(token);
 }
 
-// Simple in-memory rate limiter for login attempts
 const loginAttempts = new Map();
 function isRateLimited(ip) {
   const now = Date.now();
@@ -503,8 +514,17 @@ function redirect(res, location) {
 }
 
 function parseBody(req) {
-  if (req.body && typeof req.body === 'object') {
-    return Promise.resolve(req.body);
+  if (req.body !== undefined && req.body !== null) {
+    if (Buffer.isBuffer(req.body)) {
+      const str = req.body.toString('utf8');
+      return Promise.resolve(str ? JSON.parse(str) : {});
+    }
+    if (typeof req.body === 'string') {
+      return Promise.resolve(req.body ? JSON.parse(req.body) : {});
+    }
+    if (typeof req.body === 'object') {
+      return Promise.resolve(req.body);
+    }
   }
   return new Promise((resolve, reject) => {
     let body = '';
@@ -524,6 +544,20 @@ function parseBody(req) {
     });
     req.on('error', reject);
   });
+}
+
+function serveHtmlTemplate(res, filename) {
+  const html = filename === 'admin.html' ? templates.getAdminHtml() : templates.getLoginHtml();
+  if (html) {
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-store'
+    });
+    return res.end(html);
+  }
+
+  res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('Шаблон страницы не найден');
 }
 
 const MIME_TYPES = {
@@ -570,7 +604,8 @@ const server = http.createServer(async (req, res) => {
       clearLoginAttempts(clientIp);
 
       const sessionToken = store.createSession(adminRow.id, adminRow.password_hash);
-      const cookieHeader = `${SESSION_COOKIE_NAME}=${sessionToken}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${SESSION_TTL_SECONDS}`;
+      const secureFlag = process.env.VERCEL || req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+      const cookieHeader = `${SESSION_COOKIE_NAME}=${sessionToken}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${SESSION_TTL_SECONDS}${secureFlag}`;
 
       return sendJson(
         res,
@@ -749,12 +784,7 @@ const server = http.createServer(async (req, res) => {
       if (!admin) {
         return redirect(res, '/login');
       }
-      const adminFile = path.join(PUBLIC_DIR, 'admin.html');
-      res.writeHead(200, {
-        'Content-Type': 'text/html; charset=utf-8',
-        'Cache-Control': 'no-store'
-      });
-      return fs.createReadStream(adminFile).pipe(res);
+      return serveHtmlTemplate(res, 'admin.html');
     }
 
     if (pathname === '/login' || pathname === '/login.html') {
@@ -762,12 +792,7 @@ const server = http.createServer(async (req, res) => {
       if (admin) {
         return redirect(res, '/admin');
       }
-      const loginFile = path.join(PUBLIC_DIR, 'login.html');
-      res.writeHead(200, {
-        'Content-Type': 'text/html; charset=utf-8',
-        'Cache-Control': 'no-store'
-      });
-      return fs.createReadStream(loginFile).pipe(res);
+      return serveHtmlTemplate(res, 'login.html');
     }
 
     // Serve public static files
