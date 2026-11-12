@@ -575,7 +575,13 @@ const server = http.createServer(async (req, res) => {
   try {
     store.ensureSeeded();
     const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-    const pathname = parsedUrl.pathname;
+    let pathname = parsedUrl.searchParams.get('__pathname') || parsedUrl.pathname;
+    if (pathname === '/api/index.js' || pathname === '/api/index') {
+      const forwarded = req.headers['x-forwarded-uri'] || req.headers['x-matched-path'] || '';
+      if (forwarded) pathname = forwarded.split('?')[0];
+    }
+    if (!pathname.startsWith('/')) pathname = '/' + pathname;
+    if (pathname.length > 1 && pathname.endsWith('/')) pathname = pathname.slice(0, -1);
 
     // POST /api/auth/login
     if (req.method === 'POST' && pathname === '/api/auth/login') {
